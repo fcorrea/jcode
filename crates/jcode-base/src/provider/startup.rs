@@ -96,7 +96,7 @@ impl MultiProvider {
 
         let has_claude_creds =
             auth::claude::load_credentials().is_ok() || anthropic::has_anthropic_api_key();
-        let has_vertex = anthropic::has_vertex_credentials();
+        let has_vertex = provider_state.auth_status().anthropic.has_vertex;
         let has_openai_creds = auth::codex::load_credentials().is_ok();
         let has_copilot_api = provider_state.auth_status().copilot_has_api_token;
         let has_antigravity_creds = auth::antigravity::load_tokens().is_ok();

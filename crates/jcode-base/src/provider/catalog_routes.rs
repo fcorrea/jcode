@@ -3,7 +3,7 @@ use crate::auth::{AuthState, AuthStatus};
 use super::pricing::cheapness_for_route;
 use super::{
     ALL_OPENAI_MODELS, AccountModelAvailabilityState, ModelRoute, MultiProvider, Provider,
-    anthropic, anthropic_api_key_route_availability, anthropic_oauth_route_availability, bedrock,
+    anthropic_api_key_route_availability, anthropic_oauth_route_availability, bedrock,
     build_anthropic_oauth_route, build_anthropic_vertex_route, build_copilot_route,
     build_openai_api_key_route, build_openai_oauth_route, build_openrouter_auto_route,
     build_openrouter_endpoint_route, build_openrouter_fallback_provider_route,
@@ -147,7 +147,7 @@ pub fn append_simplified_anthropic_model_routes(
     auth: &AuthStatus,
 ) {
     let model = model.into();
-    let has_vertex = anthropic::has_vertex_credentials();
+    let has_vertex = auth.anthropic.has_vertex;
     if has_vertex {
         routes.push(ModelRoute {
             model: model.clone(),
@@ -206,7 +206,8 @@ pub(super) fn multiprovider_model_routes(provider: &MultiProvider) -> Vec<ModelR
         "anthropic.env",
     )
     .is_some();
-    let has_vertex = anthropic::has_vertex_credentials();
+    let auth = crate::auth::AuthStatus::check_fast();
+    let has_vertex = auth.anthropic.has_vertex;
     let anthropic_models = if let Some(anthropic) = provider.anthropic_provider() {
         anthropic.available_models_for_switching()
     } else if let Some(claude) = provider.claude_provider() {
@@ -262,7 +263,7 @@ pub(super) fn multiprovider_model_routes(provider: &MultiProvider) -> Vec<ModelR
     }
 
     // OpenAI models
-    let openai_auth = crate::auth::AuthStatus::check_fast();
+    let openai_auth = &auth;
     for model in openai_models {
         let availability = model_availability_for_account(&model);
         let (available, detail) = if provider.openai_provider().is_none() {
@@ -751,7 +752,7 @@ pub fn remote_model_routes_fallback(
         let mut added_any = false;
 
         if provider_for_model(model) == Some("claude") {
-            let has_vertex = anthropic::has_vertex_credentials();
+            let has_vertex = auth.anthropic.has_vertex;
             if has_vertex {
                 routes.push(build_anthropic_vertex_route(model));
                 added_any = true;

@@ -824,6 +824,12 @@ fn probe_anthropic_status(status: &mut AuthStatus) {
         anthropic.state = AuthState::Available;
     }
 
+    // Vertex AI credentials are independent of OAuth/API key.
+    if crate::provider::anthropic::has_vertex_credentials() {
+        anthropic.has_vertex = true;
+        anthropic.state = AuthState::Available;
+    }
+
     status.anthropic = anthropic;
 }
 

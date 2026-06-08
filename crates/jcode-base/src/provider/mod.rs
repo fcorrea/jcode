@@ -745,7 +745,7 @@ impl MultiProvider {
                     "anthropic.env",
                 )
                 .is_some()
-                || anthropic::has_vertex_credentials())
+                || crate::auth::AuthStatus::check_fast().anthropic.has_vertex)
         {
             crate::logging::info("Hot-initialized Anthropic provider after auth change");
             *self

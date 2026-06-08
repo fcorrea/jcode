@@ -57,6 +57,8 @@ pub struct ProviderAuth {
     pub has_oauth: bool,
     /// Has API key
     pub has_api_key: bool,
+    /// Has Google Vertex AI credentials (ANTHROPIC_VERTEX_PROJECT_ID + region env)
+    pub has_vertex: bool,
 }
 
 /// Canonical auth contract for one login provider.
