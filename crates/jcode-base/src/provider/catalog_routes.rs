@@ -3,14 +3,15 @@ use crate::auth::{AuthState, AuthStatus};
 use super::pricing::cheapness_for_route;
 use super::{
     ALL_OPENAI_MODELS, AccountModelAvailabilityState, ModelRoute, MultiProvider, Provider,
-    anthropic_api_key_route_availability, anthropic_oauth_route_availability, bedrock,
-    build_anthropic_oauth_route, build_copilot_route, build_openai_api_key_route,
-    build_openai_oauth_route, build_openrouter_auto_route, build_openrouter_endpoint_route,
-    build_openrouter_fallback_provider_route, configured_standard_openrouter_profile_routes,
-    copilot, dedupe_model_routes, direct_openai_compatible_profile_routes,
-    format_account_model_availability_detail, is_listable_model_name, known_anthropic_model_ids,
-    known_openai_model_ids, model_availability_for_account, openrouter,
-    openrouter_catalog_model_id, provider_for_model, standard_openrouter_profile_configured,
+    anthropic, anthropic_api_key_route_availability, anthropic_oauth_route_availability, bedrock,
+    build_anthropic_oauth_route, build_anthropic_vertex_route, build_copilot_route,
+    build_openai_api_key_route, build_openai_oauth_route, build_openrouter_auto_route,
+    build_openrouter_endpoint_route, build_openrouter_fallback_provider_route,
+    configured_standard_openrouter_profile_routes, copilot, dedupe_model_routes,
+    direct_openai_compatible_profile_routes, format_account_model_availability_detail,
+    is_listable_model_name, known_anthropic_model_ids, known_openai_model_ids,
+    model_availability_for_account, openrouter, openrouter_catalog_model_id, provider_for_model,
+    standard_openrouter_profile_configured,
 };
 
 /// Build the fast local route snapshot used by the TUI model picker while the
@@ -146,6 +147,17 @@ pub fn append_simplified_anthropic_model_routes(
     auth: &AuthStatus,
 ) {
     let model = model.into();
+    let has_vertex = anthropic::has_vertex_credentials();
+    if has_vertex {
+        routes.push(ModelRoute {
+            model: model.clone(),
+            provider: "Vertex AI".to_string(),
+            api_method: "vertex".to_string(),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+        });
+    }
     if auth.anthropic.has_oauth {
         routes.push(ModelRoute {
             model: model.clone(),
@@ -166,7 +178,7 @@ pub fn append_simplified_anthropic_model_routes(
             cheapness: None,
         });
     }
-    if !auth.anthropic.has_oauth && !auth.anthropic.has_api_key {
+    if !has_vertex && !auth.anthropic.has_oauth && !auth.anthropic.has_api_key {
         routes.push(ModelRoute {
             model,
             provider: "Anthropic".to_string(),
@@ -194,6 +206,7 @@ pub(super) fn multiprovider_model_routes(provider: &MultiProvider) -> Vec<ModelR
         "anthropic.env",
     )
     .is_some();
+    let has_vertex = anthropic::has_vertex_credentials();
     let anthropic_models = if let Some(anthropic) = provider.anthropic_provider() {
         anthropic.available_models_for_switching()
     } else if let Some(claude) = provider.claude_provider() {
@@ -207,7 +220,7 @@ pub(super) fn multiprovider_model_routes(provider: &MultiProvider) -> Vec<ModelR
         known_openai_model_ids()
     };
 
-    // Anthropic models (oauth and/or api-key)
+    // Anthropic models (oauth and/or api-key and/or vertex)
     for model in anthropic_models {
         let (available, detail) = if has_oauth && !has_api_key {
             anthropic_oauth_route_availability(&model)
@@ -215,6 +228,9 @@ pub(super) fn multiprovider_model_routes(provider: &MultiProvider) -> Vec<ModelR
             (true, String::new())
         };
 
+        if has_vertex {
+            routes.push(build_anthropic_vertex_route(&model));
+        }
         if has_oauth {
             routes.push(build_anthropic_oauth_route(
                 &model,
@@ -233,7 +249,7 @@ pub(super) fn multiprovider_model_routes(provider: &MultiProvider) -> Vec<ModelR
                 cheapness: cheapness_for_route(&model, "Anthropic", "claude-api"),
             });
         }
-        if !has_oauth && !has_api_key {
+        if !has_vertex && !has_oauth && !has_api_key {
             routes.push(ModelRoute {
                 model: model.to_string(),
                 provider: "Anthropic".to_string(),
@@ -734,10 +750,17 @@ pub fn remote_model_routes_fallback(
 
         let mut added_any = false;
 
-        if provider_for_model(model) == Some("claude") && auth.anthropic.has_oauth {
-            let (available, detail) = anthropic_oauth_route_availability(model);
-            routes.push(build_anthropic_oauth_route(model, available, detail));
-            added_any = true;
+        if provider_for_model(model) == Some("claude") {
+            let has_vertex = anthropic::has_vertex_credentials();
+            if has_vertex {
+                routes.push(build_anthropic_vertex_route(model));
+                added_any = true;
+            }
+            if auth.anthropic.has_oauth {
+                let (available, detail) = anthropic_oauth_route_availability(model);
+                routes.push(build_anthropic_oauth_route(model, available, detail));
+                added_any = true;
+            }
         }
 
         if ALL_OPENAI_MODELS.contains(&model.as_str()) {

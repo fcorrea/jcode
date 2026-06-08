@@ -457,6 +457,232 @@ pub(crate) fn has_anthropic_api_key() -> bool {
     load_anthropic_api_key().is_ok()
 }
 
+// --- Vertex AI support ---
+
+const VERTEX_PROJECT_ENV: &str = "ANTHROPIC_VERTEX_PROJECT_ID";
+const VERTEX_REGION_ENV: &str = "CLOUD_ML_REGION";
+const VERTEX_REGION_ENV_ALT: &str = "ANTHROPIC_VERTEX_REGION";
+/// API version required by Vertex AI in the request body
+const VERTEX_API_VERSION: &str = "vertex-2023-10-16";
+
+struct VertexConfig {
+    project_id: String,
+    region: String,
+}
+
+fn vertex_config() -> Option<VertexConfig> {
+    let project_id = std::env::var(VERTEX_PROJECT_ENV).ok()?;
+    let project_id = project_id.trim().to_string();
+    if project_id.is_empty() {
+        return None;
+    }
+
+    let region = std::env::var(VERTEX_REGION_ENV)
+        .or_else(|_| std::env::var(VERTEX_REGION_ENV_ALT))
+        .ok()?;
+    let region = region.trim().to_string();
+    if region.is_empty() {
+        return None;
+    }
+
+    Some(VertexConfig { project_id, region })
+}
+
+fn vertex_endpoint(config: &VertexConfig, model: &str) -> String {
+    let VertexConfig { project_id, region } = config;
+    let base = if region == "global" {
+        "https://aiplatform.googleapis.com".to_string()
+    } else {
+        format!("https://{region}-aiplatform.googleapis.com")
+    };
+    format!(
+        "{base}/v1/projects/{project_id}/locations/{region}/publishers/anthropic/models/{model}:streamRawPredict"
+    )
+}
+
+pub(crate) fn has_vertex_credentials() -> bool {
+    vertex_config().is_some()
+}
+
+/// Cached Google ADC access token for Vertex AI mode
+#[derive(Clone)]
+struct GoogleToken {
+    access_token: String,
+    expires_at: i64,
+}
+
+#[derive(Deserialize)]
+struct AdcFile {
+    #[serde(rename = "type")]
+    cred_type: String,
+    // authorized_user fields
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    refresh_token: Option<String>,
+    // service_account fields
+    client_email: Option<String>,
+    private_key: Option<String>,
+    token_uri: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GoogleTokenResponse {
+    access_token: String,
+    expires_in: u64,
+}
+
+async fn fetch_google_adc_token(client: &Client) -> Result<GoogleTokenResponse> {
+    // 1. GCE/Cloud Run metadata server
+    let meta_url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+    if let Ok(resp) = client
+        .get(meta_url)
+        .header("Metadata-Flavor", "Google")
+        .timeout(std::time::Duration::from_secs(1))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(token) = resp.json::<GoogleTokenResponse>().await {
+                return Ok(token);
+            }
+        }
+    }
+
+    // 2. Credential file (GOOGLE_APPLICATION_CREDENTIALS or well-known ADC path)
+    let cred_path = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+        .ok()
+        .or_else(|| {
+            let home = std::env::var("HOME").ok()?;
+            let path = format!("{home}/.config/gcloud/application_default_credentials.json");
+            std::path::Path::new(&path).exists().then_some(path)
+        });
+
+    let path = cred_path.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No Google credentials found. Run `gcloud auth application-default login` or set GOOGLE_APPLICATION_CREDENTIALS."
+        )
+    })?;
+
+    let raw = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("Failed to read credentials file: {path}"))?;
+    let adc: AdcFile = serde_json::from_str(&raw)
+        .with_context(|| format!("Failed to parse credentials file: {path}"))?;
+
+    match adc.cred_type.as_str() {
+        "authorized_user" => {
+            let client_id = adc.client_id.context("missing client_id in ADC file")?;
+            let client_secret = adc
+                .client_secret
+                .context("missing client_secret in ADC file")?;
+            let refresh_token = adc
+                .refresh_token
+                .context("missing refresh_token in ADC file")?;
+            let resp = client
+                .post("https://oauth2.googleapis.com/token")
+                .form(&[
+                    ("client_id", client_id.as_str()),
+                    ("client_secret", client_secret.as_str()),
+                    ("refresh_token", refresh_token.as_str()),
+                    ("grant_type", "refresh_token"),
+                ])
+                .send()
+                .await
+                .context("Failed to refresh Google ADC token")?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Google token refresh failed ({}): {}", status, body);
+            }
+            resp.json::<GoogleTokenResponse>()
+                .await
+                .context("Failed to parse Google token response")
+        }
+        "service_account" => {
+            let email = adc
+                .client_email
+                .context("missing client_email in service account")?;
+            let private_key = adc
+                .private_key
+                .context("missing private_key in service account")?;
+            let token_uri = adc
+                .token_uri
+                .unwrap_or_else(|| "https://oauth2.googleapis.com/token".to_string());
+            fetch_service_account_token(client, &email, &private_key, &token_uri).await
+        }
+        other => anyhow::bail!("Unsupported ADC credential type: {other}"),
+    }
+}
+
+async fn fetch_service_account_token(
+    client: &Client,
+    email: &str,
+    private_key_pem: &str,
+    token_uri: &str,
+) -> Result<GoogleTokenResponse> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let now = chrono::Utc::now().timestamp();
+    let header = serde_json::json!({"alg": "RS256", "typ": "JWT"});
+    let claim = serde_json::json!({
+        "iss": email,
+        "scope": "https://www.googleapis.com/auth/cloud-platform",
+        "aud": token_uri,
+        "iat": now,
+        "exp": now + 3600,
+    });
+
+    let header_b64 = b64.encode(serde_json::to_string(&header)?);
+    let claim_b64 = b64.encode(serde_json::to_string(&claim)?);
+    let signing_input = format!("{header_b64}.{claim_b64}");
+
+    // Parse PEM private key and sign with ring
+    let pem_body = private_key_pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(&pem_body)
+        .context("Failed to base64-decode service account private key")?;
+
+    let key_pair = ring::signature::RsaKeyPair::from_pkcs8(&der)
+        .map_err(|e| anyhow::anyhow!("Invalid RSA PKCS8 key: {e:?}"))?;
+    let rng = ring::rand::SystemRandom::new();
+    let mut signature = vec![0u8; key_pair.public().modulus_len()];
+    key_pair
+        .sign(
+            &ring::signature::RSA_PKCS1_SHA256,
+            &rng,
+            signing_input.as_bytes(),
+            &mut signature,
+        )
+        .map_err(|e| anyhow::anyhow!("RSA signing failed: {e:?}"))?;
+
+    let sig_b64 = b64.encode(&signature);
+    let jwt = format!("{signing_input}.{sig_b64}");
+
+    let resp = client
+        .post(token_uri)
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", &jwt),
+        ])
+        .send()
+        .await
+        .context("Failed to exchange service account JWT for access token")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Service account token exchange failed ({}): {}", status, body);
+    }
+    resp.json::<GoogleTokenResponse>()
+        .await
+        .context("Failed to parse service account token response")
+}
+
 /// Direct Anthropic API provider
 pub struct AnthropicProvider {
     client: Client,
@@ -469,6 +695,8 @@ pub struct AnthropicProvider {
     max_tokens: u32,
     oauth_session_id: String,
     oauth_preflight_done: Arc<AtomicBool>,
+    /// Cached Google ADC token for Vertex AI mode
+    google_token: Arc<RwLock<Option<GoogleToken>>>,
 }
 
 impl AnthropicProvider {
@@ -571,6 +799,7 @@ impl AnthropicProvider {
             max_tokens,
             oauth_session_id: Uuid::new_v4().to_string(),
             oauth_preflight_done: Arc::new(AtomicBool::new(false)),
+            google_token: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -841,6 +1070,33 @@ impl AnthropicProvider {
         Ok((fresh_creds.access_token, true))
     }
 
+    async fn get_vertex_token(&self) -> Result<String> {
+        // Check cached token (with 5-minute buffer)
+        {
+            let cached = self.google_token.read().await;
+            if let Some(ref token) = *cached {
+                let now = chrono::Utc::now().timestamp();
+                if token.expires_at > now + 300 {
+                    return Ok(token.access_token.clone());
+                }
+            }
+        }
+
+        // Fetch a fresh token
+        let resp = fetch_google_adc_token(&self.client).await?;
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = now + resp.expires_in as i64;
+        let access_token = resp.access_token.clone();
+
+        let mut cached = self.google_token.write().await;
+        *cached = Some(GoogleToken {
+            access_token: resp.access_token,
+            expires_at,
+        });
+
+        Ok(access_token)
+    }
+
     pub(crate) fn set_credential_mode(&self, mode: AnthropicCredentialMode) -> Result<()> {
         match mode {
             AnthropicCredentialMode::Auto => {}
@@ -970,7 +1226,23 @@ impl Provider for AnthropicProvider {
         system: &str,
         _resume_session_id: Option<&str>,
     ) -> Result<EventStream> {
-        let (token, is_oauth) = self.get_access_token().await?;
+        // Detect Vertex AI mode
+        let vertex_cfg = vertex_config();
+        let (token, is_oauth, vertex_url) = if let Some(ref vcfg) = vertex_cfg {
+            let google_token = self.get_vertex_token().await?;
+            let model_read = self
+                .model
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let api_model = strip_1m_suffix(&model_read).to_string();
+            let url = vertex_endpoint(vcfg, &api_model);
+            (google_token, false, Some(url))
+        } else {
+            let (tok, oauth) = self.get_access_token().await?;
+            (tok, oauth, None)
+        };
+
         if is_oauth {
             ensure_oauth_preflight(
                 &self.client,
@@ -1018,8 +1290,9 @@ impl Provider for AnthropicProvider {
         log_anthropic_canonical_input(&model, "anthropic_messages", &request, is_oauth, false);
 
         crate::logging::info(&format!(
-            "Anthropic transport: HTTPS SSE stream (oauth={})",
-            is_oauth
+            "Anthropic transport: HTTPS SSE stream (oauth={}, vertex={})",
+            is_oauth,
+            vertex_url.is_some()
         ));
 
         // Create channel for streaming events
@@ -1046,6 +1319,7 @@ impl Provider for AnthropicProvider {
                 client,
                 token,
                 is_oauth,
+                vertex_url,
                 request,
                 tx,
                 credentials,
@@ -1254,6 +1528,7 @@ impl Provider for AnthropicProvider {
             oauth_preflight_done: Arc::new(AtomicBool::new(
                 self.oauth_preflight_done.load(Ordering::Relaxed),
             )),
+            google_token: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1276,7 +1551,23 @@ impl Provider for AnthropicProvider {
         system_dynamic: &str,
         _resume_session_id: Option<&str>,
     ) -> Result<EventStream> {
-        let (token, is_oauth) = self.get_access_token().await?;
+        // Detect Vertex AI mode
+        let vertex_cfg = vertex_config();
+        let (token, is_oauth, vertex_url) = if let Some(ref vcfg) = vertex_cfg {
+            let google_token = self.get_vertex_token().await?;
+            let model_read = self
+                .model
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let api_model = strip_1m_suffix(&model_read).to_string();
+            let url = vertex_endpoint(vcfg, &api_model);
+            (google_token, false, Some(url))
+        } else {
+            let (tok, oauth) = self.get_access_token().await?;
+            (tok, oauth, None)
+        };
+
         if is_oauth {
             ensure_oauth_preflight(
                 &self.client,
@@ -1324,8 +1615,9 @@ impl Provider for AnthropicProvider {
         log_anthropic_canonical_input(&model, "anthropic_messages_split", &request, is_oauth, true);
 
         crate::logging::info(&format!(
-            "Anthropic transport: HTTPS SSE split stream (oauth={})",
-            is_oauth
+            "Anthropic transport: HTTPS SSE split stream (oauth={}, vertex={})",
+            is_oauth,
+            vertex_url.is_some()
         ));
 
         // Create channel for streaming events
@@ -1351,6 +1643,7 @@ impl Provider for AnthropicProvider {
                 client,
                 token,
                 is_oauth,
+                vertex_url,
                 request,
                 tx,
                 credentials,
@@ -1372,6 +1665,7 @@ async fn run_stream_with_retries(
     client: Client,
     initial_token: String,
     is_oauth: bool,
+    vertex_url: Option<String>,
     request: ApiRequest,
     tx: mpsc::Sender<Result<StreamEvent>>,
     credentials: Arc<RwLock<Option<CachedCredentials>>>,
@@ -1406,6 +1700,7 @@ async fn run_stream_with_retries(
             client.clone(),
             token.clone(),
             is_oauth,
+            vertex_url.as_deref(),
             request.clone(),
             tx.clone(),
             &model_name,
@@ -1538,6 +1833,7 @@ async fn stream_response(
     client: Client,
     token: String,
     is_oauth: bool,
+    vertex_url: Option<&str>,
     request: ApiRequest,
     tx: mpsc::Sender<Result<StreamEvent>>,
     model_name: &str,
@@ -1560,27 +1856,40 @@ async fn stream_response(
 
     let connect_start = std::time::Instant::now();
     // Build request with appropriate auth headers
-    let url = if is_oauth { API_URL_OAUTH } else { API_URL };
+    let is_vertex = vertex_url.is_some();
+    let url = if let Some(vurl) = vertex_url {
+        vurl.to_string()
+    } else if is_oauth {
+        API_URL_OAUTH.to_string()
+    } else {
+        API_URL.to_string()
+    };
 
     let mut req = client
-        .post(url)
-        .header("anthropic-version", API_VERSION)
+        .post(&url)
         .header("content-type", "application/json")
         .header(
             "accept",
-            if is_oauth {
+            if is_oauth && !is_vertex {
                 "application/json"
             } else {
                 "text/event-stream"
             },
         );
 
-    if is_oauth {
+    if is_vertex {
+        // Vertex AI: Bearer auth with Google ADC token.
+        // - anthropic_version goes in the request body (added below)
+        // - no anthropic-beta header (prompt caching is native)
+        // - model is stripped from the body (it's encoded in the URL)
+        req = req.header("Authorization", format!("Bearer {}", token));
+    } else if is_oauth {
         // OAuth tokens require:
         // 1. Bearer auth (NOT x-api-key)
         // 2. User-Agent matching Claude CLI
         // 3. Multiple beta headers
         // 4. ?beta=true query param (in URL above)
+        req = req.header("anthropic-version", API_VERSION);
         let beta_header = anthropic_beta_header_with_thinking(
             oauth_beta_headers(model_name),
             request.thinking.is_some(),
@@ -1594,6 +1903,7 @@ async fn stream_response(
     } else {
         // Direct API keys use x-api-key
         // Include prompt-caching beta header
+        req = req.header("anthropic-version", API_VERSION);
         let beta_header = if is_1m_model(model_name) {
             "prompt-caching-2024-07-31,context-1m-2025-08-07"
         } else {
@@ -1606,11 +1916,27 @@ async fn stream_response(
             .header("anthropic-beta", beta_header);
     }
 
-    let response = req
-        .json(&request)
-        .send()
-        .await
-        .context("Failed to send request to Anthropic API")?;
+    let response = if is_vertex {
+        // Vertex AI: serialize body, remove "model", add "anthropic_version"
+        let mut body = serde_json::to_value(&request)
+            .context("Failed to serialize Vertex AI request body")?;
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("model");
+            obj.insert(
+                "anthropic_version".to_string(),
+                serde_json::Value::String(VERTEX_API_VERSION.to_string()),
+            );
+        }
+        req.json(&body)
+            .send()
+            .await
+            .context("Failed to send request to Vertex AI")?
+    } else {
+        req.json(&request)
+            .send()
+            .await
+            .context("Failed to send request to Anthropic API")?
+    };
 
     let connect_ms = connect_start.elapsed().as_millis();
     crate::logging::info(&format!(

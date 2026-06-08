@@ -60,10 +60,10 @@ pub use jcode_provider_core::{
 };
 pub use jcode_provider_core::{ProviderFailoverPrompt, parse_failover_prompt_message};
 pub use route_builders::{
-    build_anthropic_oauth_route, build_copilot_route, build_openai_api_key_route,
-    build_openai_oauth_route, build_openrouter_auto_route, build_openrouter_endpoint_route,
-    build_openrouter_fallback_provider_route, is_listable_model_name,
-    listable_model_names_from_routes, openrouter_catalog_model_id,
+    build_anthropic_oauth_route, build_anthropic_vertex_route, build_copilot_route,
+    build_openai_api_key_route, build_openai_oauth_route, build_openrouter_auto_route,
+    build_openrouter_endpoint_route, build_openrouter_fallback_provider_route,
+    is_listable_model_name, listable_model_names_from_routes, openrouter_catalog_model_id,
 };
 pub(crate) use routing::{
     anthropic_api_key_route_availability, anthropic_oauth_route_availability,
@@ -744,7 +744,8 @@ impl MultiProvider {
                     "ANTHROPIC_API_KEY",
                     "anthropic.env",
                 )
-                .is_some())
+                .is_some()
+                || anthropic::has_vertex_credentials())
         {
             crate::logging::info("Hot-initialized Anthropic provider after auth change");
             *self
